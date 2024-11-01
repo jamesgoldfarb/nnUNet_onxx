@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
 from batchgenerators.utilities.file_and_folder_operations import load_json, isfile, save_pickle
+import onnxruntime as ort
 
 from nnunetv2.configuration import default_num_processes
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
@@ -145,3 +146,11 @@ def resample_and_save(predicted: Union[torch.Tensor, np.ndarray], target_shape: 
         segmentation = segmentation.cpu().numpy()
     np.savez_compressed(output_file, seg=segmentation.astype(np.uint8))
     torch.set_num_threads(old_threads)
+
+
+def load_and_run_onnx_model(onnx_model_path: str, input_data: np.ndarray) -> np.ndarray:
+    session = ort.InferenceSession(onnx_model_path)
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+    result = session.run([output_name], {input_name: input_data})
+    return result[0]

@@ -297,14 +297,28 @@ To facilitate the use of pretrained models on a different computer for inference
 3. Importing the Model: On the new PC, use the `nnUNetv2_install_pretrained_model_from_zip` to load the pretrained model from the .zip file.
 Please note that both computers must have nnU-Net installed along with all its dependencies to ensure compatibility and functionality of the model.
 
-[//]: # (## Examples)
+## Using the `--onnx` option for `nnUNet_predict`
 
-[//]: # ()
-[//]: # (To get you started we compiled two simple to follow examples:)
+The `--onnx` option allows you to leverage ONNX with TensorRT optimization for inference, which can significantly improve performance. Here is how to use it:
 
-[//]: # (- run a training with the 3d full resolution U-Net on the Hippocampus dataset. See [here]&#40;documentation/training_example_Hippocampus.md&#41;.)
+### First-Time Execution with `--onnx`
+1. **Export to ONNX**: Convert the nnUNet model to the ONNX format.
+2. **Optimize ONNX Model with TensorRT**: Optimize the model using TensorRT Runtime for improved performance.
+3. **Save to Disk**: Store the optimized ONNX model on disk to avoid redundant processing in future runs.
+4. **Perform Inference with Optimized Model**: Use the optimized model for inference to ensure efficient performance.
 
-[//]: # (- run inference with nnU-Net's pretrained models on the Prostate dataset. See [here]&#40;documentation/inference_example_Prostate.md&#41;.)
+### Subsequent Executions with `--onnx`
+1. **Check for Existing Optimized Files**: Before performing any export or optimization, check if the optimized model already exists on disk.
+2. **Skip Export and Optimization if Present**: If the optimized model is found, bypass the export and optimization steps.
+3. **Load Optimized Model**: Load the existing optimized model.
+4. **Perform Inference with Optimized Model**: Use the existing optimized model for inference to ensure efficient performance.
 
-[//]: # ()
-[//]: # (Usability not good enough? Let us know!)
+### Usage Example
+To use the `--onnx` option, simply add it to your `nnUNet_predict` command:
+```bash
+nnUNetv2_predict -i INPUT_FOLDER -o OUTPUT_FOLDER -d DATASET_NAME_OR_ID -c CONFIGURATION --onnx
+```
+
+### Benefits of Using ONNX Optimization
+- **Improved Performance**: TensorRT optimization can significantly speed up inference times.
+- **Efficiency**: By saving the optimized model to disk, you avoid redundant processing in future runs.
