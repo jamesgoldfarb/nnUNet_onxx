@@ -31,7 +31,9 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.json_export import recursive_fix_for_json_export
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
-from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
+
+import onnx
+import tensorrt as trt
 
 
 class nnUNetPredictor(object):
@@ -205,7 +207,8 @@ class nnUNetPredictor(object):
                            num_processes_segmentation_export: int = default_num_processes,
                            folder_with_segs_from_prev_stage: str = None,
                            num_parts: int = 1,
-                           part_id: int = 0):
+                           part_id: int = 0,
+                           use_onnx: bool = False):
         """
         This is nnU-Net's default function for making predictions. It works best for batch predictions
         (predicting many images at once).
@@ -255,7 +258,7 @@ class nnUNetPredictor(object):
                                                                                  output_filename_truncated,
                                                                                  num_processes_preprocessing)
 
-        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
+        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export, use_onnx)
 
     def _internal_get_data_iterator_from_lists_of_filenames(self,
                                                             input_list_of_lists: List[List[str]],
@@ -340,7 +343,8 @@ class nnUNetPredictor(object):
     def predict_from_data_iterator(self,
                                    data_iterator,
                                    save_probabilities: bool = False,
-                                   num_processes_segmentation_export: int = default_num_processes):
+                                   num_processes_segmentation_export: int = default_num_processes,
+                                   use_onnx: bool = False):
         """
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
@@ -372,7 +376,10 @@ class nnUNetPredictor(object):
                     sleep(0.1)
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu()
+                if use_onnx:
+                    prediction = self.predict_with_onnx(data).cpu()
+                else:
+                    prediction = self.predict_logits_from_preprocessed_data(data).cpu()
 
                 if ofile is not None:
                     # this needs to go into background processes
@@ -658,6 +665,52 @@ class nnUNetPredictor(object):
                 predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
         return predicted_logits
 
+    def export_to_onnx(self, model_path, onnx_path):
+        dummy_input = torch.randn(1, *self.configuration_manager.patch_size, device=self.device)
+        torch.onnx.export(self.network, dummy_input, onnx_path, opset_version=11)
+
+    def optimize_onnx_with_tensorrt(self, onnx_path, trt_path):
+        TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+        builder = trt.Builder(TRT_LOGGER)
+        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        parser = trt.OnnxParser(network, TRT_LOGGER)
+
+        with open(onnx_path, 'rb') as model:
+            parser.parse(model.read())
+
+        config = builder.create_builder_config()
+        config.max_workspace_size = 1 << 30  # 1GB
+        engine = builder.build_engine(network, config)
+
+        with open(trt_path, 'wb') as f:
+            f.write(engine.serialize())
+
+    def predict_with_onnx(self, data: torch.Tensor) -> torch.Tensor:
+        onnx_path = "model.onnx"
+        trt_path = "model.trt"
+
+        if not os.path.exists(trt_path):
+            self.export_to_onnx(self.network, onnx_path)
+            self.optimize_onnx_with_tensorrt(onnx_path, trt_path)
+
+        TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(TRT_LOGGER)
+        with open(trt_path, 'rb') as f:
+            engine = runtime.deserialize_cuda_engine(f.read())
+
+        context = engine.create_execution_context()
+        inputs, outputs, bindings = [], [], []
+        for binding in engine:
+            size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+            dtype = trt.nptype(engine.get_binding_dtype(binding))
+            if engine.binding_is_input(binding):
+                inputs.append(np.ascontiguousarray(data.cpu().numpy()))
+            else:
+                outputs.append(np.empty(size, dtype=dtype))
+            bindings.append(int(data.data_ptr()))
+
+        context.execute_v2(bindings)
+        return torch.tensor(outputs[0], device=self.device)
 
 def predict_entry_point_modelfolder():
     import argparse
@@ -707,6 +760,8 @@ def predict_entry_point_modelfolder():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--onnx', action='store_true', required=False, default=False,
+                        help='Set this flag to use ONNX with TensorRT optimization for inference.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -750,7 +805,8 @@ def predict_entry_point_modelfolder():
                                  num_processes_preprocessing=args.npp,
                                  num_processes_segmentation_export=args.nps,
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
-                                 num_parts=1, part_id=0)
+                                 num_parts=1, part_id=0,
+                                 use_onnx=args.onnx)
 
 
 def predict_entry_point():
@@ -816,6 +872,8 @@ def predict_entry_point():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--onnx', action='store_true', required=False, default=False,
+                        help='Set this flag to use ONNX with TensorRT optimization for inference.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -869,7 +927,8 @@ def predict_entry_point():
                                  num_processes_segmentation_export=args.nps,
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                  num_parts=args.num_parts,
-                                 part_id=args.part_id)
+                                 part_id=args.part_id,
+                                 use_onnx=args.onnx)
     # r = predict_from_raw_data(args.i,
     #                           args.o,
     #                           model_folder,
